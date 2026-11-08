@@ -1,0 +1,69 @@
+name: Profile expansion validation
+on:
+  push:
+    branches: [ci/profile-validation]
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:17.6@sha256:00bc86618629af00d2937fdc5a5d63db3ff8450acf52f0636ec813c7f4902929
+        env:
+          POSTGRES_USER: relayeruser
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: relayer
+        ports: [5432:5432]
+        options: >-
+          --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+    env:
+      SQLX_OFFLINE: 'true'
+      CARGO_TERM_COLOR: never
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      DATABASE_URL: postgres://relayeruser:password@localhost:5432/relayer
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: zakazaka95/templar-contracts
+          ref: e3c285eea55d74d23714cde2bcca9c75fca26c01
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/rust
+        with:
+          components: clippy,rustfmt
+      - uses: taiki-e/install-action@cde8c9e634f4a17bc06b61413ac0ef75450eac46
+        with:
+          tool: nextest,just
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Prepare unchanged implementation with new regression tests
+        shell: python
+        run: |
+          from pathlib import Path
+          import subprocess
+          path = Path('tools/soroban-vault-cli/src/profile.rs')
+          fixed = path.read_text()
+          Path('/tmp/fixed-profile.rs').write_text(fixed)
+          original = subprocess.check_output(['git', 'show', '6ddb4f384680b7cf1cf8ea8faa67e228cb2880ad:' + str(path)]).decode()
+          marker = '#[cfg(test)]'
+          path.write_text(original.split(marker)[0] + marker + fixed.split(marker, 1)[1])
+      - name: Reproduce original failures
+        run: |
+          set +e
+          just test-fast -p templar-soroban-vault-cli --lib profile::tests > /tmp/profile-baseline.log 2>&1
+          baseline_status=$?
+          set -e
+          cat /tmp/profile-baseline.log
+          cp /tmp/fixed-profile.rs tools/soroban-vault-cli/src/profile.rs
+          test "$baseline_status" -eq 100
+          grep 'FAIL.*command_names_in_profile_values_do_not_inject_leaf_defaults' /tmp/profile-baseline.log
+          grep 'FAIL.*command_names_in_other_option_values_do_not_inject_leaf_defaults' /tmp/profile-baseline.log
+          echo 'PASS: both new command-value regression tests fail with the unchanged implementation'
+      - name: Run complete CLI fast gate
+        run: just test-fast -p templar-soroban-vault-cli
+      - name: Check CLI lint
+        run: cargo clippy -p templar-soroban-vault-cli --all-targets -- -D warnings
